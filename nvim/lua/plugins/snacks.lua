@@ -8,7 +8,19 @@ return {
     -- or leave it empty to use the default settings
     -- refer to the configuration section below
     --bigfile = { enabled = true },
-    -- dashboard = { enabled = true },
+    dashboard = { 
+      enabled = true,
+      formats = {
+        key = function(item)
+          return { { "[", hl = "special" }, { item.key, hl = "key" }, { "]", hl = "special" } }
+        end,
+      },
+      sections = {
+        {section = "terminal", cmd = "pokeget --hide-name mudkip", height = 10, indent = 20},
+        {section = "keys", indent = 2, padding = 1},
+        {section = "startup"},
+      }
+    },
     -- explorer = { enabled = true },
     image = {enabled = true},
     -- indent = { enabled = true },

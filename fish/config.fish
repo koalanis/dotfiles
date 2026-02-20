@@ -1,8 +1,18 @@
 if status is-interactive
     # Commands to run in interactive sessions can go here
     starship init fish | source
-    echo "lets get dangerous..."
+    fastfetch
 end
 
 
+set EDITOR nvim
+
+
+
 alias konfig "cd ~/.config"
+
+
+
+
+
+

@@ -1,8 +1,3 @@
-# old
-htop
-lazygit
-images
-
 /*
 !LICENSE_TEMPLATE
 !README.md
@@ -10,5 +5,5 @@ images
 !/nvim
 !/fastfetch
 !/zellij
-!/images
 !/fish
+!/common
