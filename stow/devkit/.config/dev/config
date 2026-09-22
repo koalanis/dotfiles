@@ -1,0 +1,36 @@
+# devkit configuration. Sourced by devctl (bash) and read by the shell wrappers.
+# Machine-specific overrides belong in ~/.config/dev/config.local (git-ignored).
+
+DEV_HOME="${DEV_HOME:-$HOME/Dev}"
+
+# Host used when a spec has no gh:/gl: prefix. github|gitlab
+DEV_DEFAULT_HOST="${DEV_DEFAULT_HOST:-github}"
+
+# Owner used when a spec is a bare repo name. Empty means ask the CLI.
+DEV_GH_USER="${DEV_GH_USER:-koalanis}"
+DEV_GL_USER="${DEV_GL_USER:-koalanis}"
+
+# ssh|https - used only when falling back to plain git clone.
+DEV_CLONE_PROTOCOL="${DEV_CLONE_PROTOCOL:-ssh}"
+
+# --- project site (dev meta / dev site) -------------------------------------
+# Output directory, title, and the port `dev site --serve` listens on.
+# DEV_SITE_OUT="$HOME/.local/share/devctl/public"
+# DEV_SITE_TITLE="projects"
+# DEV_SITE_SUBTITLE="every repo on github, on gitlab, and in the workspace"
+# DEV_SITE_PORT="8765"
+
+# Seconds before a cached forge listing is refetched; repos asked of each forge.
+# DEV_META_TTL="21600"
+# DEV_META_LIMIT="200"
+
+# 1 keeps archived repos / forks that are not cloned locally.
+# DEV_META_ARCHIVED="0"
+# DEV_META_FORKS="0"
+
+# Bare `dev` in bash cds to $DEV_HOME and execs fish. Set to 0 to stay in bash.
+DEV_BASH_FISH="${DEV_BASH_FISH:-1}"
+
+_dev_local="${XDG_CONFIG_HOME:-$HOME/.config}/dev/config.local"
+if [ -r "$_dev_local" ]; then . "$_dev_local" || true; fi
+unset _dev_local
