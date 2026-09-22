@@ -1,0 +1,37 @@
+#!/usr/bin/env bash
+# Global git hook dispatcher.
+#
+# core.hooksPath points here, which means git ignores each repo's own
+# .git/hooks entirely. So this script does two things:
+#   1. runs any global behaviour for the hook it was invoked as
+#   2. forwards to the repo's own hook of the same name, if there is one
+#
+# Invoked via symlinks named after each hook (commit-msg, pre-commit, ...).
+set -euo pipefail
+
+hook=$(basename "$0")
+
+case "$hook" in
+commit-msg)
+	if command -v fish >/dev/null 2>&1; then
+		fish -c 'git-strip-llm-msg $argv[1]' -- "$1"
+	fi
+	;;
+esac
+
+# Chain to the repo-local hook that core.hooksPath displaced.
+git_dir=$(git rev-parse --git-dir)
+local_hook="$git_dir/hooks/$hook"
+if [ -x "$local_hook" ]; then
+	exec "$local_hook" "$@"
+fi
+
+# ...and to a checked-in hooks dir, the other common convention.
+for dir in .githooks .hooks; do
+	root=$(git rev-parse --show-toplevel 2>/dev/null) || break
+	if [ -x "$root/$dir/$hook" ]; then
+		exec "$root/$dir/$hook" "$@"
+	fi
+done
+
+exit 0
