@@ -2,6 +2,7 @@
 !LICENSE_TEMPLATE
 !README.md
 !starship.toml
+!starship.catppuccin.toml
 !/nvim
 !/fastfetch
 !/zellij
