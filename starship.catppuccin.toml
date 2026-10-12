@@ -172,14 +172,15 @@ RedHatEnterprise = "󱄛"
 # command exits 1 and starship hides the module, so nothing is added.
 #
 # Make it yours: each glyph is just the character in its `echo` arm below.
-# Defaults are Nerd Font icons (they render in CaskaydiaCove):
-#   U+E22E  nf-fae-planet        jupiter   plain planet
-#   U+F0D98 nf-md-rotate_orbit   mars      orbit with arrows
-#   U+F15DB nf-md-orbit_variant  neptune   alternate orbit
-#   U+F0018 nf-md-orbit          saturn    ringed orbit
-# Unicode planet symbols (U+2646 U+2643 U+2642 U+2644) or an emoji like U+1FA90
-# work too, but the symbol glyphs are not in your Nerd Font and will fall back
-# to another font, so the prompt segments may look mismatched.
+# Defaults are the real astronomical symbols:
+#   U+2643  ♃  jupiter
+#   U+2642  ♂  mars
+#   U+2646  ♆  neptune
+#   U+2644  ♄  saturn
+# CaskaydiaCove does not include these, so kitty.conf maps them to FreeMono
+# (monospace, so the powerline segments stay aligned):
+#     symbol_map U+2642,U+2643,U+2644,U+2646 FreeMono
+# Any other character (a Nerd Font icon, an emoji) works too.
 [custom.planet]
 description = "Planet glyph for the current host"
 when = true
@@ -187,10 +188,10 @@ style = "bg:surface0 fg:text"
 format = '[ $output ]($style)'
 command = """
 case "$(hostname | cut -d. -f1 | tr '[:upper:]' '[:lower:]')" in
-  jupiter)         echo '' ;;   # nf-fae-planet
-  mars)            echo '󰶘' ;;   # nf-md-rotate_orbit
-  neptune)         echo '󱗛' ;;   # nf-md-orbit_variant
-  desktop-l8ab2nr) echo '󰀘' ;;   # nf-md-orbit
+  jupiter)         echo '♃' ;;   # U+2643 Jupiter
+  mars)            echo '♂' ;;   # U+2642 Mars
+  neptune)         echo '♆' ;;   # U+2646 Neptune
+  desktop-l8ab2nr) echo '♄' ;;   # U+2644 Saturn
   *)               exit 1 ;;
 esac
 """
