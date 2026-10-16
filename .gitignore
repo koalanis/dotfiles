@@ -9,3 +9,5 @@
 !/fish
 !/common
 !.wezterm.lua
+!/stow
+!/bootstrap-dev.sh

@@ -1,0 +1,1001 @@
+#!/usr/bin/env bash
+# devctl - manage the ~/Dev workspace across github (gh) and gitlab (glab).
+# The `dev` shell function wraps this so `dev` and `dev cd <repo>` can change
+# the calling shell's directory; everything else is handled here.
+
+set -euo pipefail
+
+DEV_CONFIG="${DEV_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/dev/config}"
+# shellcheck source=/dev/null
+if [ -r "$DEV_CONFIG" ]; then . "$DEV_CONFIG" || true; fi
+
+DEV_HOME="${DEV_HOME:-$HOME/Dev}"
+DEV_DEFAULT_HOST="${DEV_DEFAULT_HOST:-github}"
+DEV_GH_USER="${DEV_GH_USER:-}"
+DEV_GL_USER="${DEV_GL_USER:-}"
+DEV_CLONE_PROTOCOL="${DEV_CLONE_PROTOCOL:-ssh}"
+
+DEV_CACHE_DIR="${DEV_CACHE_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/dev}"
+DEV_SITE_OUT="${DEV_SITE_OUT:-${XDG_DATA_HOME:-$HOME/.local/share}/devctl/public}"
+DEV_SITE_TITLE="${DEV_SITE_TITLE:-projects}"
+DEV_SITE_SUBTITLE="${DEV_SITE_SUBTITLE:-every repo on github, on gitlab, and in the workspace}"
+DEV_SITE_PORT="${DEV_SITE_PORT:-8765}"
+DEV_META_TTL="${DEV_META_TTL:-21600}"       # seconds before a forge listing is refetched
+DEV_META_LIMIT="${DEV_META_LIMIT:-200}"     # repos to ask each forge for
+DEV_META_README="${DEV_META_README:-800}"   # bytes of README kept as the excerpt
+DEV_META_ARCHIVED="${DEV_META_ARCHIVED:-0}" # 1 keeps archived remote repos
+DEV_META_FORKS="${DEV_META_FORKS:-0}"       # 1 keeps forks
+
+if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
+    C_RESET=$'\033[0m'; C_DIM=$'\033[2m'; C_BOLD=$'\033[1m'
+    C_RED=$'\033[31m'; C_GREEN=$'\033[32m'; C_YELLOW=$'\033[33m'; C_BLUE=$'\033[34m'
+else
+    C_RESET=; C_DIM=; C_BOLD=; C_RED=; C_GREEN=; C_YELLOW=; C_BLUE=
+fi
+
+die()  { printf '%sdevctl: %s%s\n' "$C_RED" "$*" "$C_RESET" >&2; exit 1; }
+warn() { printf '%sdevctl: %s%s\n' "$C_YELLOW" "$*" "$C_RESET" >&2; }
+info() { printf '%s%s%s\n' "$C_DIM" "$*" "$C_RESET" >&2; }
+has()  { command -v "$1" >/dev/null 2>&1; }
+
+# ---------------------------------------------------------------- repo specs
+
+# Extract owner/repo from any git url form (scheme:// or scp-style git@host:path).
+url_path() {
+    local url="$1" path
+    case "$url" in
+        *://*)
+            path="${url#*://}"      # strip scheme
+            path="${path#*@}"       # strip userinfo
+            path="${path#*/}"       # strip host
+            ;;
+        *:*)
+            path="${url#*:}"        # scp form: everything after the colon
+            ;;
+        *)
+            path="$url"
+            ;;
+    esac
+    printf '%s' "${path%.git}"
+}
+
+# Parse a repo spec into: SPEC_HOST, SPEC_PATH (owner/repo), SPEC_URL, SPEC_NAME.
+parse_spec() {
+    local spec="$1"
+    SPEC_HOST=; SPEC_PATH=; SPEC_URL=; SPEC_NAME=
+
+    case "$spec" in
+        git@*:*|ssh://*|https://*|http://*)
+            SPEC_URL="$spec"
+            case "$spec" in
+                *github.com*) SPEC_HOST=github ;;
+                *gitlab.com*) SPEC_HOST=gitlab ;;
+                *)            SPEC_HOST=git ;;
+            esac
+            SPEC_PATH="$(url_path "$spec")"
+            ;;
+        gh:*|github:*)
+            SPEC_HOST=github; SPEC_PATH="${spec#*:}" ;;
+        gl:*|gitlab:*)
+            SPEC_HOST=gitlab; SPEC_PATH="${spec#*:}" ;;
+        */*)
+            SPEC_HOST="$DEV_DEFAULT_HOST"; SPEC_PATH="$spec" ;;
+        *)
+            SPEC_HOST="$DEV_DEFAULT_HOST"
+            SPEC_PATH="$(default_owner "$SPEC_HOST")/$spec"
+            [ "${SPEC_PATH%%/*}" = "" ] && die "no default owner for $SPEC_HOST; use owner/repo or set DEV_${SPEC_HOST}_USER"
+            ;;
+    esac
+
+    SPEC_PATH="${SPEC_PATH%.git}"
+    SPEC_NAME="${SPEC_PATH##*/}"
+    [ -n "$SPEC_NAME" ] || die "cannot parse repo spec: $spec"
+}
+
+default_owner() {
+    case "$1" in
+        github)
+            if [ -n "$DEV_GH_USER" ]; then printf '%s' "$DEV_GH_USER"
+            elif has gh; then gh api user --jq .login 2>/dev/null || true; fi ;;
+        gitlab)
+            if [ -n "$DEV_GL_USER" ]; then printf '%s' "$DEV_GL_USER"
+            elif has glab; then glab api user 2>/dev/null | jq -r .username 2>/dev/null || true; fi ;;
+    esac
+}
+
+spec_url() {
+    case "$SPEC_HOST" in
+        github) [ "$DEV_CLONE_PROTOCOL" = ssh ] && printf 'git@github.com:%s.git' "$SPEC_PATH" || printf 'https://github.com/%s.git' "$SPEC_PATH" ;;
+        gitlab) [ "$DEV_CLONE_PROTOCOL" = ssh ] && printf 'git@gitlab.com:%s.git' "$SPEC_PATH" || printf 'https://gitlab.com/%s.git' "$SPEC_PATH" ;;
+        *)      printf '%s' "$SPEC_URL" ;;
+    esac
+}
+
+# ------------------------------------------------------------------ helpers
+
+repos() {
+    local d
+    for d in "$DEV_HOME"/*/; do
+        [ -d "${d}.git" ] || continue
+        printf '%s\n' "${d%/}"
+    done
+}
+
+resolve_repo() {
+    local name="$1" d
+    [ -d "$DEV_HOME/$name/.git" ] && { printf '%s' "$DEV_HOME/$name"; return; }
+    for d in $(repos); do
+        case "${d##*/}" in *"$name"*) printf '%s' "$d"; return ;; esac
+    done
+    return 1
+}
+
+repo_host() {
+    local url; url="$(git -C "$1" remote get-url origin 2>/dev/null || true)"
+    case "$url" in
+        *github.com*) printf 'github' ;;
+        *gitlab.com*) printf 'gitlab' ;;
+        '')           printf 'local' ;;
+        *)            printf 'git' ;;
+    esac
+}
+
+# ----------------------------------------------------------------- commands
+
+cmd_root() { printf '%s\n' "$DEV_HOME"; }
+
+cmd_path() {
+    [ $# -ge 1 ] || { cmd_root; return; }
+    resolve_repo "$1" || die "no repo matching '$1' in $DEV_HOME"
+    printf '\n'
+}
+
+cmd_list() {
+    local long=0
+    [ "${1:-}" = "-l" ] && long=1
+    mkdir -p "$DEV_HOME"
+    local d name host branch
+    for d in $(repos); do
+        name="${d##*/}"
+        if [ "$long" = 1 ]; then
+            host="$(repo_host "$d")"
+            branch="$(git -C "$d" symbolic-ref --quiet --short HEAD 2>/dev/null || echo detached)"
+            printf '%-28s %-8s %s\n' "$name" "$host" "$branch"
+        else
+            printf '%s\n' "$name"
+        fi
+    done
+}
+
+cmd_status() {
+    mkdir -p "$DEV_HOME"
+    local d name dirty ahead behind branch flags counts
+    for d in $(repos); do
+        name="${d##*/}"
+        branch="$(git -C "$d" symbolic-ref --quiet --short HEAD 2>/dev/null || echo detached)"
+        dirty="$(git -C "$d" status --porcelain 2>/dev/null | wc -l)"
+        ahead=0; behind=0
+        if counts="$(git -C "$d" rev-list --left-right --count '@{upstream}...HEAD' 2>/dev/null)"; then
+            behind="${counts%%	*}"; ahead="${counts##*	}"
+        fi
+        flags=""
+        [ "$dirty"  -gt 0 ] && flags="$flags ${C_YELLOW}*${dirty} dirty${C_RESET}"
+        [ "$ahead"  -gt 0 ] && flags="$flags ${C_GREEN}^${ahead} unpushed${C_RESET}"
+        [ "$behind" -gt 0 ] && flags="$flags ${C_BLUE}v${behind} behind${C_RESET}"
+        [ -z "$flags" ] && flags=" ${C_DIM}clean${C_RESET}"
+        printf '%-28s %-18s%b\n' "$name" "$branch" "$flags"
+    done
+}
+
+cmd_clone() {
+    local spec="" dest="" host_flag=""
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -d|--dest) dest="$2"; shift 2 ;;
+            --gh|--github) host_flag=github; shift ;;
+            --gl|--gitlab) host_flag=gitlab; shift ;;
+            --https) DEV_CLONE_PROTOCOL=https; shift ;;
+            --ssh)   DEV_CLONE_PROTOCOL=ssh; shift ;;
+            -*) die "unknown flag: $1" ;;
+            *)  spec="$1"; shift ;;
+        esac
+    done
+    [ -n "$spec" ] || die "usage: devctl clone [gh:|gl:]<owner/repo|url> [-d dir]"
+
+    parse_spec "$spec"
+    [ -n "$host_flag" ] && SPEC_HOST="$host_flag"
+    [ -n "$dest" ] || dest="$SPEC_NAME"
+    local target="$DEV_HOME/$dest"
+
+    mkdir -p "$DEV_HOME"
+    if [ -e "$target" ]; then
+        info "$dest already exists"
+        printf '%s\n' "$target"
+        return 0
+    fi
+
+    case "$SPEC_HOST" in
+        github) has gh   && gh   repo clone "$SPEC_PATH" "$target" || git clone "$(spec_url)" "$target" ;;
+        gitlab) has glab && glab repo clone "$SPEC_PATH" "$target" || git clone "$(spec_url)" "$target" ;;
+        *)      git clone "$(spec_url)" "$target" ;;
+    esac
+    printf '%s\n' "$target"
+}
+
+cmd_new() {
+    local name="" host="" private=1 remote=0 desc=""
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --gh|--github) host=github; remote=1; shift ;;
+            --gl|--gitlab) host=gitlab; remote=1; shift ;;
+            --public)  private=0; shift ;;
+            --private) private=1; shift ;;
+            -m|--description) desc="$2"; shift 2 ;;
+            -*) die "unknown flag: $1" ;;
+            *)  name="$1"; shift ;;
+        esac
+    done
+    [ -n "$name" ] || die "usage: devctl new <name> [--gh|--gl] [--public] [-m desc]"
+
+    local target="$DEV_HOME/$name"
+    if [ ! -d "$target" ]; then
+        mkdir -p "$target"
+        git -C "$target" init -q
+        printf '# %s\n' "$name" > "$target/README.md"
+        git -C "$target" add README.md
+        git -C "$target" commit -qm "chore: initial commit"
+    else
+        info "$name already exists"
+    fi
+
+    if [ "$remote" = 1 ]; then
+        local vis owner
+        [ "$private" = 1 ] && vis=private || vis=public
+        owner="$(default_owner "$host")"
+        [ -n "$owner" ] || die "cannot determine your $host username; set DEV_GH_USER / DEV_GL_USER"
+        case "$host" in
+            github)
+                has gh || die "gh is not installed"
+                gh repo create "$owner/$name" "--$vis" ${desc:+--description "$desc"} \
+                   --source "$target" --remote origin --push ;;
+            gitlab)
+                has glab || die "glab is not installed"
+                ( cd "$target" && glab repo create "$name" --"$vis" ${desc:+--description "$desc"} --defaultBranch main )
+                # glab skips wiring up origin when the directory is already a
+                # git repo, which it always is here. Do it ourselves rather
+                # than failing on the push.
+                if ! git -C "$target" remote get-url origin >/dev/null 2>&1; then
+                    if [ "$DEV_CLONE_PROTOCOL" = ssh ]; then
+                        git -C "$target" remote add origin "git@gitlab.com:$owner/$name.git"
+                    else
+                        git -C "$target" remote add origin "https://gitlab.com/$owner/$name.git"
+                    fi
+                fi
+                git -C "$target" push -u origin HEAD ;;
+        esac
+    fi
+    printf '%s\n' "$target"
+}
+
+cmd_sync() {
+    local d name out
+    for d in $(repos); do
+        name="${d##*/}"
+        if [ -n "$(git -C "$d" status --porcelain 2>/dev/null)" ]; then
+            printf '%-28s %sskipped (dirty)%s\n' "$name" "$C_YELLOW" "$C_RESET"
+            continue
+        fi
+        if out="$(git -C "$d" pull --ff-only --quiet 2>&1)"; then
+            printf '%-28s %sok%s\n' "$name" "$C_GREEN" "$C_RESET"
+        else
+            printf '%-28s %s%s%s\n' "$name" "$C_RED" "${out%%$'\n'*}" "$C_RESET"
+        fi
+    done
+}
+
+cmd_fetch() {
+    local d
+    for d in $(repos); do
+        git -C "$d" fetch --all --prune --quiet 2>/dev/null &
+    done
+    wait
+    info "fetched $(repos | wc -l) repos"
+}
+
+cmd_each() {
+    [ $# -gt 0 ] || die "usage: devctl each <command ...>"
+    local d
+    for d in $(repos); do
+        printf '%s== %s%s\n' "$C_BOLD" "${d##*/}" "$C_RESET"
+        ( cd "$d" && "$@" ) || warn "failed in ${d##*/}"
+    done
+}
+
+cmd_browse() {
+    local d; d="$(resolve_repo "${1:-}")" || die "no repo matching '${1:-}'"
+    case "$(repo_host "$d")" in
+        github) has gh   && ( cd "$d" && gh   repo view --web ) ;;
+        gitlab) has glab && ( cd "$d" && glab repo view --web ) ;;
+        *) die "no forge CLI for $(repo_host "$d")" ;;
+    esac
+}
+
+cmd_mine() {
+    local host="${1:-$DEV_DEFAULT_HOST}" limit="${2:-100}"
+    case "$host" in
+        github|gh) has gh   || die "gh is not installed";   gh repo list --limit "$limit" ;;
+        gitlab|gl) has glab || die "glab is not installed"; glab repo list --per-page "$limit" ;;
+        *) die "unknown host: $host (github|gitlab)" ;;
+    esac
+}
+
+DEV_MANIFEST="${DEV_MANIFEST:-${XDG_CONFIG_HOME:-$HOME/.config}/dev/repos.txt}"
+
+# Print a portable spec (gh:owner/repo, gl:group/repo, or a url) for a repo dir.
+repo_spec() {
+    local url path
+    url="$(git -C "$1" remote get-url origin 2>/dev/null || true)"
+    [ -n "$url" ] || return 1
+    path="$(url_path "$url")"
+    case "$url" in
+        *github.com*) printf 'gh:%s' "$path" ;;
+        *gitlab.com*) printf 'gl:%s' "$path" ;;
+        *)            printf '%s' "$url" ;;
+    esac
+}
+
+cmd_manifest() {
+    local write=0
+    [ "${1:-}" = "--write" ] && write=1
+    local out d spec name
+    out=""
+    for d in $(repos); do
+        name="${d##*/}"
+        if spec="$(repo_spec "$d")"; then
+            case "$spec" in
+                *"/$name") out="$out$spec"$'\n' ;;
+                *)         out="$out$spec -d $name"$'\n' ;;   # dir name differs from repo name
+            esac
+        else
+            warn "$name has no origin remote; not in manifest"
+        fi
+    done
+    if [ "$write" = 1 ]; then
+        mkdir -p "$(dirname "$DEV_MANIFEST")"
+        printf '%s' "$out" > "$DEV_MANIFEST"
+        info "wrote $DEV_MANIFEST"
+    else
+        printf '%s' "$out"
+    fi
+}
+
+cmd_restore() {
+    local file="${1:-$DEV_MANIFEST}"
+    [ -r "$file" ] || die "no manifest at $file (run 'devctl manifest --write' on a machine that has your repos)"
+    local line
+    while IFS= read -r line; do
+        case "$line" in ''|'#'*) continue ;; esac
+        # shellcheck disable=SC2086
+        cmd_clone $line >/dev/null || warn "failed: $line"
+    done < "$file"
+    info "restore complete"
+}
+
+cmd_doctor() {
+    local ok=0
+    printf '%sworkspace%s\n' "$C_BOLD" "$C_RESET"
+    if [ -d "$DEV_HOME" ]; then
+        printf '  %sok%s   %s (%s repos)\n' "$C_GREEN" "$C_RESET" "$DEV_HOME" "$(repos | wc -l)"
+    else
+        printf '  %smiss%s %s does not exist\n' "$C_RED" "$C_RESET" "$DEV_HOME"; ok=1
+    fi
+
+    printf '%stools%s\n' "$C_BOLD" "$C_RESET"
+    local t
+    for t in git gh glab stow fish jq python3; do
+        if has "$t"; then printf '  %sok%s   %s\n' "$C_GREEN" "$C_RESET" "$t"
+        else printf '  %smiss%s %s\n' "$C_YELLOW" "$C_RESET" "$t"; fi
+    done
+
+    printf '%sauth%s\n' "$C_BOLD" "$C_RESET"
+    if has gh; then
+        if gh auth status >/dev/null 2>&1; then printf '  %sok%s   github as %s\n' "$C_GREEN" "$C_RESET" "$(default_owner github)"
+        else printf '  %sbad%s  github: run `gh auth login`\n' "$C_RED" "$C_RESET"; ok=1; fi
+    fi
+    if has glab; then
+        if glab auth status >/dev/null 2>&1; then printf '  %sok%s   gitlab as %s\n' "$C_GREEN" "$C_RESET" "$(default_owner gitlab)"
+        else printf '  %sbad%s  gitlab: run `glab auth login`\n' "$C_RED" "$C_RESET"; ok=1; fi
+    fi
+
+    printf '%sshell%s\n' "$C_BOLD" "$C_RESET"
+    [ -r "$DEV_CONFIG" ] \
+        && printf '  %sok%s   config %s\n' "$C_GREEN" "$C_RESET" "$DEV_CONFIG" \
+        || printf '  %smiss%s config %s\n' "$C_YELLOW" "$C_RESET" "$DEV_CONFIG"
+    return $ok
+}
+
+# ------------------------------------------------------------ site metadata
+
+strip_ansi() { sed -e 's/\x1b\[[0-9;]*[a-zA-Z]//g' -e 's/\x1b(B//g'; }
+
+slugify() {
+    printf '%s' "$1" | tr '[:upper:]' '[:lower:]' \
+        | sed -e 's/[^a-z0-9._-]/-/g' -e 's/-\{2,\}/-/g' -e 's/^-//' -e 's/-$//'
+}
+
+need_jq() { has jq || die "jq is required for 'meta' and 'site'"; }
+
+# Directory holding render.py and style.css. Stowed next to this script.
+site_lib() {
+    local self dir cand
+    self="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || printf '%s' "$0")"
+    dir="$(dirname "$self")"
+    for cand in "${DEV_SITE_LIB:-}" "$dir/../share/devctl/site" \
+                "${XDG_DATA_HOME:-$HOME/.local/share}/devctl/site"; do
+        if [ -n "$cand" ] && [ -r "$cand/render.py" ]; then readlink -f "$cand"; return 0; fi
+    done
+    die "cannot find render.py; set DEV_SITE_LIB to the devctl site directory"
+}
+
+# Cached forge listing for $1 (github|gitlab). Refetched when older than
+# DEV_META_TTL or when DEV_META_REFRESH=1; a failed fetch falls back to cache.
+forge_cache() {
+    local host="$1" file="$DEV_CACHE_DIR/forge-$host.json" age raw=""
+    mkdir -p "$DEV_CACHE_DIR"
+    if [ -s "$file" ] && [ "${DEV_META_REFRESH:-0}" != 1 ]; then
+        age=$(( $(date +%s) - $(date -r "$file" +%s) ))
+        if [ "$age" -lt "$DEV_META_TTL" ]; then printf '%s' "$file"; return 0; fi
+    fi
+    case "$host" in
+        github)
+            if has gh && gh auth status >/dev/null 2>&1; then
+                raw="$(gh repo list --limit "$DEV_META_LIMIT" --json \
+                    nameWithOwner,name,description,url,sshUrl,isPrivate,isArchived,isFork,primaryLanguage,pushedAt,stargazerCount,repositoryTopics \
+                    2>/dev/null || true)"
+            fi ;;
+        gitlab)
+            if has glab && glab auth status >/dev/null 2>&1; then
+                raw="$(glab repo list --per-page "$DEV_META_LIMIT" -F json 2>/dev/null || true)"
+            fi ;;
+    esac
+    if [ -n "$raw" ] && printf '%s' "$raw" | jq -e 'type == "array"' >/dev/null 2>&1; then
+        printf '%s' "$raw" > "$file"
+    elif [ -s "$file" ]; then
+        warn "$host listing failed; using the cached copy"
+    else
+        warn "no $host listing (cli missing, not logged in, or empty)"
+        printf '[]' > "$file"
+    fi
+    printf '%s' "$file"
+}
+
+# Forge listing normalized to the common project shape.
+forge_projects() {
+    local host="$1" file
+    file="$(forge_cache "$host")"
+    case "$host" in
+        github)
+            jq '[ .[] | {
+                key: ("github:" + .nameWithOwner),
+                name: .name,
+                slug: (.name | ascii_downcase | gsub("[^a-z0-9._-]"; "-") | gsub("-{2,}"; "-") | ltrimstr("-")),
+                title: .name,
+                host: "github",
+                path: .nameWithOwner,
+                url: .url,
+                clone_url: (.sshUrl // ""),
+                description: (.description // ""),
+                language: (.primaryLanguage.name // ""),
+                visibility: (if .isPrivate then "private" else "public" end),
+                stars: (.stargazerCount // 0),
+                pushed_at: (.pushedAt // ""),
+                tags: [ (.repositoryTopics // [])[] | (.name? // (.topic? | .name?)) | select(. != null) ],
+                archived: (.isArchived // false),
+                fork: (.isFork // false)
+            } ]' "$file" ;;
+        gitlab)
+            jq '[ .[] | {
+                key: ("gitlab:" + .path_with_namespace),
+                name: (.path // .name),
+                slug: ((.path // .name) | ascii_downcase | gsub("[^a-z0-9._-]"; "-") | gsub("-{2,}"; "-") | ltrimstr("-")),
+                title: (.name // .path),
+                host: "gitlab",
+                path: .path_with_namespace,
+                url: .web_url,
+                clone_url: (.ssh_url_to_repo // ""),
+                description: (.description // ""),
+                language: "",
+                visibility: (.visibility // ""),
+                stars: (.star_count // 0),
+                pushed_at: (.last_activity_at // ""),
+                tags: (.topics // []),
+                archived: (.archived // false),
+                fork: (.forked_from_project != null)
+            } ]' "$file" ;;
+    esac
+}
+
+# Per-repo metadata override: .devctl.json in the repo root wins over anything
+# the forge or git says. Keys: title, blurb, tags, status, links, hidden.
+repo_override() {
+    local f="$1/.devctl.json"
+    if [ -r "$f" ] && jq -e 'type == "object"' "$f" >/dev/null 2>&1; then
+        cat "$f"
+    else
+        printf '{}'
+        [ -r "$f" ] && warn "${1##*/}: .devctl.json is not a json object; ignored"
+    fi
+}
+
+# Every clone in the workspace, as project objects.
+local_projects() {
+    local d f name host url path key branch dirty ahead behind counts hash cdate subj readme
+    for d in $(repos); do
+        name="${d##*/}"
+        url="$(git -C "$d" remote get-url origin 2>/dev/null || true)"
+        host="$(repo_host "$d")"
+        path=""
+        [ -n "$url" ] && path="$(url_path "$url")"
+        case "$host" in
+            github|gitlab) key="$host:$path" ;;
+            *)             key="local:$name" ;;
+        esac
+        branch="$(git -C "$d" symbolic-ref --quiet --short HEAD 2>/dev/null || echo detached)"
+        dirty="$(git -C "$d" status --porcelain 2>/dev/null | wc -l)"
+        ahead=0; behind=0
+        if counts="$(git -C "$d" rev-list --left-right --count '@{upstream}...HEAD' 2>/dev/null)"; then
+            behind="${counts%%	*}"; ahead="${counts##*	}"
+        fi
+        hash="$(git -C "$d" log -1 --format=%h 2>/dev/null || true)"
+        cdate="$(git -C "$d" log -1 --format=%cI 2>/dev/null || true)"
+        subj="$(git -C "$d" log -1 --format=%s 2>/dev/null || true)"
+        readme=""
+        for f in README.md readme.md README.markdown README README.rst; do
+            [ -r "$d/$f" ] && { readme="$(head -c "$DEV_META_README" "$d/$f")"; break; }
+        done
+        jq -n --arg key "$key" --arg name "$name" --arg slug "$(slugify "$name")" \
+              --arg host "$host" --arg path "$path" --arg dir "$d" --arg clone "$url" \
+              --arg branch "$branch" --arg hash "$hash" --arg cdate "$cdate" --arg subj "$subj" \
+              --arg readme "$readme" \
+              --argjson dirty "${dirty:-0}" --argjson ahead "${ahead:-0}" --argjson behind "${behind:-0}" \
+              --argjson override "$(repo_override "$d")" '
+            {
+                key: $key, name: $name, slug: $slug, title: $name, host: $host,
+                readme: $readme,
+                local: {
+                    path: $dir, branch: $branch, dirty: $dirty, ahead: $ahead, behind: $behind,
+                    last_commit: { hash: $hash, date: $cdate, subject: $subj }
+                }
+            }
+            + (if $clone == "" then {} else { clone_url: $clone } end)
+            + (if $path  == "" then {} else { path: $path } end)
+            + $override'
+    done | jq -s '.'
+}
+
+nb_notebooks() {
+    has nb || return 0
+    nb notebooks --names 2>/dev/null | strip_ansi | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//'
+}
+
+# Notebook whose name is the project name, or slugifies to it.
+match_notebook() {
+    local name="$1" books="$2" b nslug
+    nslug="$(slugify "$name")"
+    while IFS= read -r b; do
+        [ -n "$b" ] || continue
+        [ "$b" = "$name" ] && { printf '%s' "$b"; return 0; }
+        [ "$(slugify "$b")" = "$nslug" ] && { printf '%s' "$b"; return 0; }
+    done <<< "$books"
+    return 1
+}
+
+# One notebook's notes: id, file path, title (first heading), mtime.
+notes_json() {
+    local nbk="$1"
+    nb "$nbk:list" --paths --no-color 2>/dev/null | strip_ansi | {
+        local line id file title
+        while IFS= read -r line; do
+            case "$line" in '['*']'*) ;; *) continue ;; esac
+            id="${line%%]*}"; id="${id##*:}"
+            file="${line#*] }"
+            [ -f "$file" ] || continue
+            title="$(sed -n 's/^#\{1,6\}[[:space:]]*//p' "$file" | head -n 1)"
+            [ -n "$title" ] || title="${file##*/}"
+            printf '%s\t%s\t%s\t%s\n' "$id" "$file" "$title" "$(date -r "$file" +%F 2>/dev/null || true)"
+        done
+    } | jq -R -s --arg nbk "$nbk" '
+        split("\n") | map(select(length > 0) | split("\t"))
+        | { notebook: $nbk, count: length,
+            items: map({ id: .[0], file: .[1], title: .[2], modified: .[3] }) }'
+}
+
+# Project names on stdin -> { "<name>": <notes object> }.
+notes_index() {
+    local books name nbk
+    books="$(nb_notebooks)"
+    while IFS= read -r name; do
+        [ -n "$name" ] || continue
+        nbk="$(match_notebook "$name" "$books")" || continue
+        jq -n --arg k "$name" --argjson v "$(notes_json "$nbk")" '{ key: $k, value: $v }'
+    done | jq -s 'from_entries'
+}
+
+cmd_meta() {
+    local out="" local_only=0
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --refresh)     DEV_META_REFRESH=1; shift ;;
+            --local)       local_only=1; shift ;;
+            -o|--out)      out="$2"; shift 2 ;;
+            -*) die "unknown flag: $1" ;;
+            *)  die "unexpected argument: $1" ;;
+        esac
+    done
+    need_jq
+
+    local gh_items='[]' gl_items='[]' local_items merged notes json
+    if [ "$local_only" = 0 ]; then
+        gh_items="$(forge_projects github)"
+        gl_items="$(forge_projects gitlab)"
+    fi
+    local_items="$(local_projects)"
+
+    # Merge forge and clone views of the same repo, drop archived/fork noise,
+    # then make slugs unique so every project gets its own page.
+    merged="$(jq -n --argjson a "$gh_items" --argjson b "$gl_items" --argjson c "$local_items" \
+                    --argjson keep_archived "$DEV_META_ARCHIVED" --argjson keep_forks "$DEV_META_FORKS" '
+        ($a + $b + $c)
+        | group_by(.key) | map(reduce .[] as $x ({}; . * $x)) | map(del(.key))
+        | map(select(($keep_archived == 1) or (.archived != true) or (.local != null)))
+        | map(select(($keep_forks == 1) or (.fork != true) or (.local != null)))
+        | map(. + (if (.url // "") == "" and (.path // "") != "" and (.host == "github" or .host == "gitlab")
+                   then { url: ("https://" + .host + ".com/" + .path) } else {} end))
+        | group_by(.slug)
+        | map(if length > 1 then map(.slug = .slug + "-" + (.host // "local")) else . end)
+        | (add // [])')"
+
+    notes="$(printf '%s' "$merged" | jq -r '.[].name' | notes_index)"
+
+    json="$(jq -n --arg ts "$(date -Iseconds)" --arg title "$DEV_SITE_TITLE" \
+                  --arg sub "$DEV_SITE_SUBTITLE" --arg ghu "$DEV_GH_USER" --arg glu "$DEV_GL_USER" \
+                  --argjson projects "$merged" --argjson notes "$notes" '
+        {
+            generated_at: $ts,
+            title: $title,
+            subtitle: $sub,
+            owner: { github: $ghu, gitlab: $glu },
+            projects: ($projects
+                | map(. + { notes: ($notes[.name] // { notebook: null, count: 0, items: [] }),
+                            updated: ([(.pushed_at // ""), (.local.last_commit.date // "")] | max) })
+                | sort_by(.updated) | reverse)
+        }')"
+
+    if [ -n "$out" ]; then
+        mkdir -p "$(dirname "$out")"
+        printf '%s\n' "$json" > "$out"
+        info "wrote $out"
+    else
+        printf '%s\n' "$json"
+    fi
+}
+
+cmd_site() {
+    local out="$DEV_SITE_OUT" serve=0 port="$DEV_SITE_PORT" open=0 meta_args=()
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -o|--out)  out="$2"; shift 2 ;;
+            --refresh) meta_args+=(--refresh); shift ;;
+            --local)   meta_args+=(--local); shift ;;
+            --open)    open=1; shift ;;
+            --serve)   serve=1; shift
+                       case "${1:-}" in ''|-*) ;; *) port="$1"; shift ;; esac ;;
+            -*) die "unknown flag: $1" ;;
+            *)  die "unexpected argument: $1" ;;
+        esac
+    done
+    need_jq
+    has python3 || die "python3 is required for 'devctl site'"
+
+    local lib meta
+    lib="$(site_lib)"
+    meta="$DEV_CACHE_DIR/projects.json"
+    cmd_meta "${meta_args[@]}" --out "$meta"
+    python3 "$lib/render.py" --meta "$meta" --out "$out" --assets "$lib" >&2
+
+    printf '%s\n' "$out/index.html"
+    if [ "$open" = 1 ] && has xdg-open; then xdg-open "$out/index.html" >/dev/null 2>&1 || true; fi
+    if [ "$serve" = 1 ]; then
+        info "serving $out at http://127.0.0.1:$port (ctrl-c to stop)"
+        python3 -m http.server "$port" --bind 127.0.0.1 --directory "$out"
+    fi
+}
+
+# ---------------------------------------------------------------- per-command help
+
+# Quoted heredocs keep backticks literal; @NAME@ placeholders carry live config in.
+usage_expand() {
+    sed -e "s|@DEV_HOME@|$DEV_HOME|g" \
+        -e "s|@DEV_DEFAULT_HOST@|$DEV_DEFAULT_HOST|g" \
+        -e "s|@DEV_CLONE_PROTOCOL@|$DEV_CLONE_PROTOCOL|g" \
+        -e "s|@DEV_MANIFEST@|$DEV_MANIFEST|g" \
+        -e "s|@DEV_CACHE_DIR@|$DEV_CACHE_DIR|g" \
+        -e "s|@DEV_SITE_OUT@|$DEV_SITE_OUT|g" \
+        -e "s|@DEV_SITE_PORT@|$DEV_SITE_PORT|g" \
+        -e "s|@DEV_META_TTL@|$DEV_META_TTL|g"
+}
+
+show_usage() {
+    case "$1" in
+    root|home) usage_expand <<'EOF'
+usage: devctl root
+
+Print the workspace path (@DEV_HOME@). Bare `dev` in a shell cds there.
+EOF
+    ;;
+    path|cd) usage_expand <<'EOF'
+usage: devctl path [<name>]
+       dev cd [<name>]
+
+Print the path of a repo in the workspace. <name> is a substring: an exact
+directory name wins, otherwise the first repo whose name contains it. With no
+argument, prints the workspace root. Exits non-zero if nothing matches.
+
+  devctl path foxdie-q      ->  ~/Dev/foxdie-quartz
+  dev cd foxdie-q           cds there (shell function)
+EOF
+    ;;
+    list|ls) usage_expand <<'EOF'
+usage: devctl list [-l]
+
+List every git repo in the workspace, one per line.
+
+  -l    also show the forge (github/gitlab/git/local) and current branch
+EOF
+    ;;
+    status|st) usage_expand <<'EOF'
+usage: devctl status
+
+One line per repo: branch, then uncommitted files, commits ahead of upstream,
+and commits behind it. Repos with none of those read "clean". Nothing is
+fetched first, so "behind" is as of the last fetch; run `devctl fetch` for
+fresh numbers.
+EOF
+    ;;
+    clone|get) usage_expand <<'EOF'
+usage: devctl clone <spec> [-d <dir>] [--gh|--gl] [--ssh|--https]
+       dev clone <spec> ...        (clones, then cds into it)
+
+Clone into the workspace. Uses `gh repo clone` / `glab repo clone` when the CLI
+is installed, plain `git clone` otherwise. Prints the destination path; if the
+directory already exists it prints the path and does nothing.
+
+  <spec>          gh:owner/repo      github
+                  gl:group/sub/repo  gitlab
+                  owner/repo         DEV_DEFAULT_HOST (currently: @DEV_DEFAULT_HOST@)
+                  repo               your namespace on the default host
+                  https://… git@…    cloned verbatim, host read from the url
+  -d, --dest      directory name under @DEV_HOME@ (default: the repo name)
+  --gh, --gl      force the forge, overriding the spec prefix
+  --ssh, --https  protocol for the plain-git fallback (default: @DEV_CLONE_PROTOCOL@)
+EOF
+    ;;
+    new|init) usage_expand <<'EOF'
+usage: devctl new <name> [--gh|--gl] [--public|--private] [-m <description>]
+       dev new <name> ...          (creates, then cds into it)
+
+Create @DEV_HOME@/<name>, git init, write a README, and make the first commit.
+With --gh or --gl it also creates the remote and pushes. Safe to re-run: an
+existing directory is left alone.
+
+  --gh, --gl        create the remote on github / gitlab
+  --private         private remote (default)
+  --public          public remote
+  -m, --description remote description
+EOF
+    ;;
+    sync|pull) usage_expand <<'EOF'
+usage: devctl sync
+
+Fast-forward-only pull in every repo. Repos with uncommitted changes are
+skipped, not stashed. One line of result per repo; a failed pull shows its
+first line of error.
+EOF
+    ;;
+    fetch) usage_expand <<'EOF'
+usage: devctl fetch
+
+git fetch --all --prune in every repo, in parallel. Touches no working tree,
+so it is safe with dirty repos. Run it before `devctl status` to get accurate
+behind-counts.
+EOF
+    ;;
+    each|exec) usage_expand <<'EOF'
+usage: devctl each <command> [args ...]
+
+Run a command in every repo, printing the repo name as a header. Keeps going
+when a repo fails, warning on stderr. Flags after the command belong to that
+command, not to devctl.
+
+  devctl each git gc --auto
+  devctl each git log --oneline -1
+EOF
+    ;;
+    browse|open) usage_expand <<'EOF'
+usage: devctl browse <name>
+
+Open a repo's web page in the browser via `gh repo view --web` or
+`glab repo view --web`, chosen from the origin remote. <name> matches the same
+way as `devctl path`.
+EOF
+    ;;
+    mine|remote) usage_expand <<'EOF'
+usage: devctl mine [github|gitlab] [<limit>]
+
+List your repos on the forge, cloned or not. Defaults to DEV_DEFAULT_HOST
+(currently: @DEV_DEFAULT_HOST@) and a limit of 100. Requires the forge CLI to be
+authenticated.
+EOF
+    ;;
+    manifest) usage_expand <<'EOF'
+usage: devctl manifest [--write]
+
+Print every repo in the workspace as a spec `devctl clone` understands, so the
+set of repos can be recreated elsewhere. A repo whose directory name differs
+from the remote name gets a `-d <dir>` suffix. Repos with no origin remote
+cannot be expressed and are reported on stderr instead.
+
+  --write   write to @DEV_MANIFEST@ instead of stdout
+EOF
+    ;;
+    restore) usage_expand <<'EOF'
+usage: devctl restore [<file>]
+
+Clone every spec in the manifest (default: @DEV_MANIFEST@). Repos already
+present are skipped, so it is safe to re-run; a failed clone warns and the rest
+continue. Blank lines and lines starting with # are ignored.
+EOF
+    ;;
+    doctor) usage_expand <<'EOF'
+usage: devctl doctor
+
+Check the workspace directory, the tools (git, gh, glab, stow, fish), forge
+authentication, and the config file. Exits non-zero if something needs
+attention, so it works in a bootstrap script.
+EOF
+    ;;
+    meta) usage_expand <<'EOF'
+usage: devctl meta [--refresh] [--local] [-o <file>]
+
+Print the project metadata the site is built from, as json on stdout. One
+object per project, merged from three sources: your github and gitlab repo
+listings, the clones in @DEV_HOME@, and the nb notebook whose name matches the
+project. A repo that exists only on a forge, or only on disk, still gets an
+entry.
+
+Forge listings are cached in @DEV_CACHE_DIR@ and refetched when older than
+DEV_META_TTL (currently @DEV_META_TTL@s). If a forge call fails the cached copy
+is used and a warning goes to stderr.
+
+  --refresh     refetch both forges now, ignoring the cache
+  --local       skip the forges entirely; workspace clones only
+  -o, --out     write to a file instead of stdout
+
+A repo can override its own metadata with a .devctl.json in its root:
+
+  { "title": "Foxdie", "blurb": "read-only vault host",
+    "tags": ["vault", "jupiter"], "status": "running",
+    "links": [{"label": "docs", "url": "https://..."}], "hidden": false }
+
+Those keys win over anything the forge or git reports; "hidden" keeps the
+project out of the site.
+EOF
+    ;;
+    site|pages) usage_expand <<'EOF'
+usage: devctl site [-o <dir>] [--refresh] [--local] [--open] [--serve [port]]
+
+Build the static project site: an index of every project and one page per
+project, with its forge link, clone state, last commit, README excerpt, and
+links to the matching nb notes. Output is plain html, css and the
+projects.json it was rendered from - no server needed, copy it anywhere.
+
+  -o, --out     output directory (default: @DEV_SITE_OUT@)
+  --refresh     refetch the forge listings first
+  --local       workspace clones only, no forge calls
+  --open        open the result in the browser
+  --serve [p]   serve the output on 127.0.0.1:p (default: @DEV_SITE_PORT@)
+
+Rendering is metadata-driven: `devctl meta` writes @DEV_CACHE_DIR@/projects.json
+and the renderer reads nothing else. Templates live next to the renderer in
+share/devctl/site (override with DEV_SITE_LIB).
+
+Notes come from nb: a project gets a notes section when a notebook has the
+same name as the repo, or a name that slugifies to it. Note links are file://
+paths to the markdown, plus the `nb <notebook>:<id>` command to open it.
+EOF
+    ;;
+    *) cmd_help ;;
+    esac
+}
+
+cmd_help() {
+    cat <<'EOF'
+devctl - manage the ~/Dev workspace
+
+usage: devctl <command> [args]
+
+  root                      print the workspace path
+  path <name>               print the path of a repo (fuzzy match)
+  list [-l]                 list repos (-l adds host and branch)
+  status                    dirty / unpushed / behind for every repo
+  clone <spec> [-d dir]     clone into the workspace
+  new <name> [--gh|--gl]    create a repo locally, optionally on a forge
+  sync                      ff-only pull every clean repo
+  fetch                     fetch --all --prune in parallel
+  each <cmd ...>            run a command in every repo
+  browse <name>             open a repo in the browser
+  mine [github|gitlab]      list your remote repos
+  manifest [--write]        print/save every repo as a clonable spec
+  restore [file]            clone everything in the manifest
+  meta [--refresh]          project metadata as json (forges + clones + nb)
+  site [--serve]            build the static project site from that metadata
+  doctor                    check workspace, tools, auth
+  help                      this
+
+run `devctl <command> -h` for the details of one command.
+
+repo specs:
+  owner/repo                default host (DEV_DEFAULT_HOST)
+  gh:owner/repo             github via gh
+  gl:group/sub/repo         gitlab via glab
+  repo                      your own namespace on the default host
+  https://... git@...       cloned verbatim
+
+flags on clone/new: --gh --gl --https --ssh --public --private
+
+config: ~/.config/dev/config
+  DEV_HOME, DEV_DEFAULT_HOST, DEV_GH_USER, DEV_GL_USER, DEV_CLONE_PROTOCOL
+manifest: ~/.config/dev/repos.txt
+
+the `dev` shell function wraps this so `dev` and `dev cd <repo>` change directory.
+EOF
+}
+
+main() {
+    local cmd="${1:-help}"; shift || true
+
+    # `devctl <cmd> -h` prints that command's help. For `each` only the first
+    # argument counts, since everything after it belongs to the wrapped command.
+    case "$cmd" in
+        each|exec)
+            case "${1:-}" in -h|--help) show_usage "$cmd"; exit 0 ;; esac ;;
+        help|-h|--help) ;;
+        *)
+            for _arg in "$@"; do
+                case "$_arg" in -h|--help) show_usage "$cmd"; exit 0 ;; esac
+            done ;;
+    esac
+
+    case "$cmd" in
+        root|home)      cmd_root "$@" ;;
+        path|cd)        cmd_path "$@" ;;
+        list|ls)        cmd_list "$@" ;;
+        status|st)      cmd_status "$@" ;;
+        clone|get)      cmd_clone "$@" ;;
+        new|init)       cmd_new "$@" ;;
+        sync|pull)      cmd_sync "$@" ;;
+        fetch)          cmd_fetch "$@" ;;
+        each|exec)      cmd_each "$@" ;;
+        browse|open)    cmd_browse "$@" ;;
+        mine|remote)    cmd_mine "$@" ;;
+        manifest)       cmd_manifest "$@" ;;
+        restore)        cmd_restore "$@" ;;
+        doctor)         cmd_doctor "$@" ;;
+        meta)           cmd_meta "$@" ;;
+        site|pages)     cmd_site "$@" ;;
+        help|-h|--help) cmd_help ;;
+        *)              die "unknown command: $cmd (try 'devctl help')" ;;
+    esac
+}
+
+main "$@"
